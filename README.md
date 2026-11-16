@@ -1,104 +1,44 @@
-# DairyGuard-Research
-Hybrid anomaly detection (Isolation Forest + XGBoost + rule checks) for dairy procurement fraud, with experiments on a synthetic dataset.
+# DairyGuard Research
 
-"""
-DairyGuard — build_combined_detector.py
+Fraud and anomaly detection for dairy milk procurement, combining Isolation Forest anomaly scores, an XGBoost classifier and deterministic rule checks into a risk score for ranking records for inspection, evaluated on a synthetic 100,000-record dataset with injected fraud labels.
 
-The final, best unsupervised-only detection pipeline (no model type
-changed, still Isolation Forest under the hood). Combines three
-improvements over your original M3 baseline (F1 0.426):
+> A manuscript describing this work is under revision for resubmission.
 
-  1. Per-farmer z-scores ADDED alongside the existing global z-scores
-     (8 features total instead of 4)
-  2. A SEPARATE Isolation Forest fit per animal_type (cow/buffalo/goat
-     have different natural ranges — one global model was blurring them)
-  3. Combined with the capacity-mismatch and duplicate-slip rule checks
-     you already have, via simple OR logic
+## My contribution
+I trained the Isolation Forest component and implemented the rule-based checks. (Team members: add names and roles.)
 
-Result on the synthetic dataset (scored in-sample on the full dataset,
-not a held-out test): precision 0.611, recall 0.540, F1 0.573
-— a 34% relative improvement over the original 0.426, with false-
-positive rate still low (0.68%, i.e. ~1 in 147 clean batches).
+## Data
+All records are **synthetic**. Fraud is injected with known labels, so every result measures detection of *injected* anomalies, not real fraud. The 100,000-record dataset has columns `quantity_litres`, `fat_percent`, `snf_percent`, `ph`, `temperature_c`, `animal_type` and the label `is_fraud`. **[Describe how it was generated, or link the generator.]**
 
-Run from the repo root (after running src/generate_data.py):
-    python src/build_combined_detector.py
-"""
+## Final experiment: `src/final_100k_experiment.py`
+```
+pip install -r requirements.txt
+python src/final_100k_experiment.py path/to/dairyguard_100k.csv
+```
+Protocol:
+1. Stratified 80:20 split (random state 42): 80,000 training records and a 20,000-record blind test set.
+2. Isolation Forest (300 trees) fitted on the **normal training records only**, so it is semi-supervised, not purely unsupervised. Its score and flag become two features.
+3. XGBoost (300 trees, depth 5, learning rate 0.05, `scale_pos_weight` 50) trained on the 80,000 training records using the numeric features, the animal type and the two Isolation Forest features.
+4. The test set is evaluated once with a fixed 0.50 probability threshold. No tuning on the test set.
+5. `is_fraud`, `fraud_type`, `adulteration_flag` (identical to `is_fraud` in this dataset) and all identifiers are excluded from the features.
 
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import IsolationForest
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, accuracy_score
+The script prints precision, recall, F1, accuracy, false-positive rate, ROC-AUC, PR-AUC and the confusion matrix, and writes `dairyguard_100k_final_80k_metrics.json`.
 
-INPUT_PATH = "output/procurement_with_fraud_labels.csv"
-OUTPUT_PATH = "output/procurement_with_fraud_labels.csv"  # adds new columns, doesn't remove old ones
-CONTAMINATION = 0.012
+## Results
+The script was smoke-tested end to end on a small toy CSV with the expected columns (numbers from that test are meaningless and not reported). The real 100,000-record numbers must come from your own run.
 
+**[Run the script and paste your verified numbers here, with the exact precision, recall and confusion counts.]**
 
-def add_farmer_zscores(df):
-    for col in ["volume_liters", "fat_pct", "ph", "temperature_c"]:
-        df[f"{col}_farmer_zscore"] = df.groupby("farmer_id")[col].transform(
-            lambda x: (x - x.mean()) / (x.std() if x.std() > 0 else 1)
-        ).fillna(0)
-    return df
+## Hybrid risk score (described in the manuscript)
+The manuscript fuses the three signals into one risk score `R = w1*s_IF + w2*p_XGB + w3*r_rule` (Isolation Forest score, XGBoost probability, binary rule flag; weights 0.40 / 0.45 / 0.15; threshold R = 0.6399066144; scores normalised to [0, 1]). `src/final_100k_experiment.py` covers the XGBoost + Isolation Forest stage only. **[Add the script that computes R, the rule flags on the 100K dataset, and the ablation table (Rules only, Isolation Forest only, XGBoost alone, XGBoost + Isolation Forest, final hybrid), and link it here.]**
 
+## Prototype pipeline: `prototype/`
+An earlier, smaller pipeline (about 15,000 rows) with the rule checks (capacity mismatch, duplicate slips, OCR slip-ID matching) and per-animal-type Isolation Forests. `generate_data.py` needs `data/adfJuly2025final_1.csv` and `data/census.csv` (Maharashtra district procurement and livestock-census tables; check redistribution terms or link the sources).
 
-def fit_per_animal_type_isolation_forest(df, feature_cols):
-    """One Isolation Forest per animal_type, since cow/buffalo/goat have
-    very different natural volume/fat/temperature ranges — a single
-    global model blurs those together and hurts detection."""
-    X = df[feature_cols].fillna(0)
-    scores = np.zeros(len(df))
-    for animal in df["animal_type"].unique():
-        mask = df["animal_type"] == animal
-        iso = IsolationForest(contamination=CONTAMINATION, random_state=42, n_estimators=300)
-        iso.fit(X[mask])
-        scores[mask] = -iso.decision_function(X[mask])
-    return scores
-
-
-def main():
-    df = pd.read_csv(INPUT_PATH)
-    df = add_farmer_zscores(df)
-
-    feature_cols = [
-        "volume_liters_zscore", "fat_pct_zscore", "ph_zscore", "temperature_c_zscore",
-        "volume_liters_farmer_zscore", "fat_pct_farmer_zscore", "ph_farmer_zscore", "temperature_c_farmer_zscore",
-    ]
-    scores = fit_per_animal_type_isolation_forest(df, feature_cols)
-    df["anomaly_score_v2"] = scores
-    df["model_predicted_anomaly_v2"] = (scores > np.percentile(scores, 100 * (1 - CONTAMINATION))).astype(int)
-
-    # Duplicate rule check (rebuilt here so this script works standalone)
-    dup_count = df.groupby(["farmer_id", "date", "volume_liters"])["batch_id"].transform("count")
-    df["duplicate_flag"] = (dup_count > 1).astype(int)
-
-    # Final combined flag: model OR capacity-mismatch OR duplicate
-    df["combined_fraud_flag_v2"] = (
-        (df["model_predicted_anomaly_v2"] == 1) |
-        (df["capacity_mismatch_flag"] == 1) |
-        (df["duplicate_flag"] == 1)
-    ).astype(int)
-
-    # --- Evaluate ---
-    tn, fp, fn, tp = confusion_matrix(df["is_fraud"], df["combined_fraud_flag_v2"]).ravel()
-    p, r, f, _ = precision_recall_fscore_support(df["is_fraud"], df["combined_fraud_flag_v2"], average="binary", zero_division=0)
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
-    acc = accuracy_score(df["is_fraud"], df["combined_fraud_flag_v2"])
-
-    print("Combined detector (Isolation Forest v2 + capacity + duplicate rules):")
-    print(f"  Precision: {p:.3f}")
-    print(f"  Recall:    {r:.3f}")
-    print(f"  F1:        {f:.3f}")
-    print(f"  Accuracy:  {acc:.4f}")
-    print(f"  False-positive rate: {fpr:.4f}  ({fp} false alerts out of {fp+tn} clean rows)")
-    print(f"  TP={tp} FP={fp} FN={fn} TN={tn}")
-
-    df.to_csv(OUTPUT_PATH, index=False)
-    print(f"\nSaved to {OUTPUT_PATH}")
-    print("New columns: volume_liters_farmer_zscore, fat_pct_farmer_zscore, ph_farmer_zscore,")
-    print("temperature_c_farmer_zscore, anomaly_score_v2, model_predicted_anomaly_v2,")
-    print("duplicate_flag, combined_fraud_flag_v2  <-- this is the one to use as your final prediction")
-
-
-if __name__ == "__main__":
-    main()
+## Limitations
+- Fraud labels are synthetic, so scores show detection of our injected anomalies, not real-world fraud.
+- Isolation Forest scores for training rows are computed on data the forest was fitted on (for normal rows), while test rows are unseen; out-of-fold scores would be cleaner.
+- The validation split in the script is only counted, not used for tuning; hyperparameters are fixed in the code.
+- `scale_pos_weight` 50 is well above the class ratio, which favours recall over precision.
+- In the prototype, some rules mirror how fraud was injected, and the Louvain step uses fraud labels to build its graph, so it is an illustration only.
+- Validation on real procurement data is future work.
